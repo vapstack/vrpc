@@ -1,5 +1,8 @@
 # vrpc
 
+[![GoDoc](https://godoc.org/github.com/vapstack/vrpc?status.svg)](https://godoc.org/github.com/vapstack/vrpc)
+[![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/vrpc/master/LICENSE)
+
 A very basic RPC framework for Go running over standard HTTP.
 
 - No code generation.
