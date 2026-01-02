@@ -680,23 +680,25 @@ func NewClient(options ...ClientOption) (*Client, error) {
 	return c, nil
 }
 
-// Call is a generic helper function that invokes a method on the Client and if err is nil, casts the result to *T.
+// Call is a generic helper function that invokes a method on the Client
+// and returns result as *T.
 func Call[T any](c *Client, ctx context.Context, service, method string, req any) (*T, error) {
-	res := reflect.New(reflect.TypeFor[T]()).Interface()
+	res := new(T)
 	if err := c.Call(ctx, service, method, req, res); err != nil {
 		return nil, err
 	}
-	return res.(*T), nil
+	return res, nil
 }
 
-// CallFor is a generic helper function that invokes a method on the Client and if err is nil, casts the result to *T.
+// CallFor is a generic helper function that invokes a method on the Client
+// using S type as a service name and returns result as *T.
 func CallFor[S any, T any](c *Client, ctx context.Context, method string, req any) (*T, error) {
 	svc := reflect.TypeFor[S]().Name()
-	res := reflect.New(reflect.TypeFor[T]()).Interface()
+	res := new(T)
 	if err := c.Call(ctx, svc, method, req, res); err != nil {
 		return nil, err
 	}
-	return res.(*T), nil
+	return res, nil
 }
 
 // Call invokes a synchronous RPC method.
