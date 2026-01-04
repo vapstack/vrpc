@@ -67,10 +67,20 @@ var (
 type Codec interface {
 	Encode(w io.Writer, v any) error
 	Decode(r io.Reader, v any) error
+	NewEncoder(w io.Writer) Encoder
+	NewDecoder(r io.Reader) Decoder
 	ContentType() string
 }
 
+type (
+	Encoder interface{ Encode(any) error }
+	Decoder interface{ Decode(any) error }
+)
+
 type msgpackCodec struct{}
+
+func (msgpackCodec) NewEncoder(w io.Writer) Encoder { return msgpack.NewEncoder(w) }
+func (msgpackCodec) NewDecoder(r io.Reader) Decoder { return msgpack.NewDecoder(r) }
 
 func (msgpackCodec) Encode(w io.Writer, v any) error {
 	enc := msgpackEncPool.Get().(*msgpack.Encoder)
@@ -95,12 +105,16 @@ var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strin
 
 type gobCodec struct{}
 
+func (gobCodec) NewEncoder(w io.Writer) Encoder  { return gob.NewEncoder(w) }
+func (gobCodec) NewDecoder(r io.Reader) Decoder  { return gob.NewDecoder(r) }
 func (gobCodec) Encode(w io.Writer, v any) error { return gob.NewEncoder(w).Encode(v) }
 func (gobCodec) Decode(r io.Reader, v any) error { return gob.NewDecoder(r).Decode(v) }
 func (gobCodec) ContentType() string             { return "application/gob" }
 
 type jsonCodec struct{}
 
+func (jsonCodec) NewEncoder(w io.Writer) Encoder  { return json.NewEncoder(w) }
+func (jsonCodec) NewDecoder(r io.Reader) Decoder  { return json.NewDecoder(r) }
 func (jsonCodec) Encode(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
 func (jsonCodec) Decode(r io.Reader, v any) error { return json.NewDecoder(r).Decode(v) }
 func (jsonCodec) ContentType() string             { return "application/json" }
