@@ -31,14 +31,24 @@ To combine the simplicity of `net/rpc` with the infrastructure compatibility of 
 | **Context**       | `context.Context` | `context.Context` | Limited         | `context.Context` |
 | **Performance**   | Moderate          | High              | High            | Varies            |
 | **Compatibility** | High              | Moderate          | Low             | High              |
+| **Streaming**     | One-way           | Bidi              | No              | Varies            |
 
 ### Usage
 
 Services must implement methods with the following signature:
 
 ```go
+// unary
 func (s *Service) Method(ctx context.Context, req *Request) (*Response, error)
+
+// server streaming
+func (s *Service) Method(ctx context.Context, req *Request, w io.Writer) (*Response, error)
+
+// client streaming
+func (s *Service) Method(ctx context.Context, req *Request, r io.Reader) (*Response, error)
 ```
+
+Bidirectional streaming is hard to get right on top of HTTP/1 so it's not supported.
 
 ### Server
 
@@ -98,6 +108,53 @@ func main() {
     err = c.Beacon(ctx, "GreeterService", "SayHello", req)
 }
 ```
+
+### Server Streaming
+
+```go
+func (s *Service) Method(context.Context, *Request, io.Writer) (*Response, error)
+```
+The data written to `io.Writer` is streamed to the client incrementally.
+After the method returns, the returned `*Response` is sent as the final message 
+or, if an error is returned, the error is sent to the client.
+
+`io.Writer` provided to the method also implements
+```go
+interface { Flush() error }
+```
+
+Calling `Flush` forces buffered data to be sent immediately.
+Otherwise, data may be buffered to improve throughput.
+With frequent `Flush`, latency is minimized at the cost of throughput.
+
+The choice is left to the service implementation.
+
+On the client side, server streaming is consumed using:
+```go
+err := client.ServerStream(ctx, "ServiceName", "Method", req, dst, resp)
+```
+`dst` receives streamed binary data, `resp` receives the final response.
+
+### Client Streaming
+
+```go
+func (s *Service) Method(context.Context, *Request, io.Reader) (*Response, error)
+```
+
+Client uploads a stream of binary data, which is exposed to the service as `io.Reader`.
+The initial request object is decoded before streaming begins.
+The service may read from `io.Reader` incrementally.
+When the client finishes uploading, the service returns a response or an error.
+
+On the client side, client streaming is performed using:
+```
+err := client.ClientStream(ctx, "ServiceName", "Method", req, src, resp)
+```
+`src` is read until EOF, `resp` receives the final response.
+
+If the server returns before fully reading the stream, the client upload is aborted.
+
+Context cancellation should be handled and respected by both sides.
 
 ### Service Mesh Environments
 
@@ -208,3 +265,28 @@ After weighing the trade-offs, I decided to stick with `net/http`.
     - `Content-Type` - from the codec (`application/json`, `application/gob`, etc.)
     - `X-Vrpc-Err` - error message when the call failed
     - `X-Vrpc` - call mode
+- **Streaming**:
+    - Streaming is implemented on top of HTTP using a framed protocol.
+    - Frame types:
+        - `1` - message (request or response value)
+        - `2` - binary (streamed data)
+        - `3` - ping (keepalive)
+        - `4` - error (end of stream)
+        - `0` - final (end of stream)
+    - The framing format is internal and not part of the user API,
+      but allows custom implementations in other languages.
+      All frames are encoded using the same (requested or default) codec
+      as the request. Frame marker is a simple `byte` also encoded by the codec.
+      Message (`1`) and binary (`2`) markers are followed by the encoded data.
+    - Keepalive (pings):
+        - Ping frames are sent only when there is no recent activity.
+        - Ping frames prevent idle connections from being closed by proxies.
+        - Ping traffic is suppressed when the stream is actively used.
+        - Receivers always ignore ping frames.
+        - Sending policy is implementation-defined.
+    - Streaming writers are not safe for concurrent use.
+    - Streaming output is buffered:
+        - Writes without `Flush` prioritize throughput.
+        - Explicit `Flush` prioritizes latency.
+        - HTTP transport may also flush automatically based on buffer size.
+    - Streaming using JSON as a codec is inefficient.

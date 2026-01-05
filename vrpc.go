@@ -1,6 +1,7 @@
 package vrpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/gob"
@@ -27,6 +28,9 @@ const (
 	ErrorHeader = "X-Vrpc-Err"
 	// ProtoHeader is the HTTP header key used to specify the RPC call mode.
 	ProtoHeader = "X-Vrpc"
+
+	// StatusEncodingError is returned by server when it failed to encode the response.
+	StatusEncodingError = 567
 )
 
 var (
@@ -38,12 +42,14 @@ var (
 
 	bufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 	argPool    = sync.Pool{New: func() any {
-		args := make([]reflect.Value, 2)
+		args := make([]reflect.Value, 3)
 		return &args
 	}}
 
 	contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
 	errorType   = reflect.TypeOf((*error)(nil)).Elem()
+	readerType  = reflect.TypeOf((*io.Reader)(nil)).Elem()
+	writerType  = reflect.TypeOf((*io.Writer)(nil)).Elem()
 )
 
 // RegisterCodec adds a codec to the global list of server codecs.
@@ -121,10 +127,33 @@ func (jsonCodec) ContentType() string             { return "application/json" }
 
 var defaultCodec = msgpackCodec{}
 
+/**/
+
 type methodType struct {
+	mode methodMode
+
 	fn reflect.Value
 	rt reflect.Type
 }
+
+func (m *methodType) call(args *[]reflect.Value, n int) (results []reflect.Value, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("service panic: %v", p)
+		}
+		clear(*args)
+		argPool.Put(args)
+	}()
+	return m.fn.Call((*args)[:n]), nil
+}
+
+type methodMode uint8
+
+const (
+	modeUnary        methodMode = iota // Method(context.Context, *Request) (*Response, error)
+	modeServerStream                   // Method(context.Context, *Request, io.Writer) (*Response,error)
+	modeClientStream                   // Method(context.Context, *Request, io.Reader) (*Response,error)
+)
 
 // Handler serves RPC requests for a specific service implementation.
 type Handler struct {
@@ -135,9 +164,11 @@ type Handler struct {
 
 // NewHandler creates a new Handler for the given implementation, using a user-provided service name.
 // It reflects over impl to find suitable methods.
-// A suitable method must have the following signature:
+// A suitable method must have one of the following signatures:
 //
-//	Method(context.Context, *Request) (*Response, error).
+//	Method(context.Context, *Request) (*Response, error). // unary
+//	Method(context.Context, *Request, io.Writer) (*Response, error)  // download/stream
+//	Method(context.Context, *Request, io.Reader) (*Response, error)  // upload/stream
 func NewHandler(service string, impl any) (*Handler, error) {
 	if strings.TrimSpace(service) == "" {
 		return nil, fmt.Errorf("service name must not be empty")
@@ -295,6 +326,9 @@ func newHandler(service string, impl any, contract reflect.Type, strict bool) (*
 				continue
 			}
 			if inContract {
+				if s.mode != cs.mode {
+					return nil, fmt.Errorf("method %v has incompatible streaming mode (expected %v)", method.Name, cs.mode)
+				}
 				if s.req != cs.req {
 					return nil, fmt.Errorf("method %v has incompatible request type %v (expected %v)", method.Name, s.req, cs.req)
 				}
@@ -305,8 +339,9 @@ func newHandler(service string, impl any, contract reflect.Type, strict bool) (*
 		}
 
 		h.methods[method.Name] = &methodType{
-			fn: h.impl.MethodByName(method.Name),
-			rt: s.req.Elem(),
+			fn:   h.impl.MethodByName(method.Name),
+			rt:   s.req.Elem(),
+			mode: s.mode,
 		}
 	}
 
@@ -326,17 +361,34 @@ func newHandler(service string, impl any, contract reflect.Type, strict bool) (*
 }
 
 type rpcSignature struct {
-	req reflect.Type
-	res reflect.Type
+	req  reflect.Type
+	res  reflect.Type
+	mode methodMode
 }
 
 func rpcMethod(mtype reflect.Type, offset int) (rpcSignature, bool) {
 
 	// Method(context.Context, *T1) (*T2, error)
+	// Method(context.Context, *T1, io.Writer) (*T2, error)
+	// Method(context.Context, *T1, io.Reader) (*T2, error)
 
 	var sig rpcSignature
 
-	if mtype.NumIn() != 2+offset || mtype.NumOut() != 2 {
+	if mtype.NumOut() != 2 {
+		return sig, false
+	}
+
+	if !mtype.Out(1).AssignableTo(errorType) {
+		return sig, false
+	}
+	sig.res = mtype.Out(0)
+	if sig.res.Kind() != reflect.Pointer {
+		return sig, false
+	}
+
+	/**/
+
+	if mtype.NumIn() != 2+offset && mtype.NumIn() != 3+offset {
 		return sig, false
 	}
 	ctxIdx := offset
@@ -345,22 +397,30 @@ func rpcMethod(mtype reflect.Type, offset int) (rpcSignature, bool) {
 	if !mtype.In(ctxIdx).AssignableTo(contextType) {
 		return sig, false
 	}
-
 	sig.req = mtype.In(reqIdx)
 	if sig.req.Kind() != reflect.Pointer {
 		return sig, false
 	}
 
-	sig.res = mtype.Out(0)
-	if sig.res.Kind() != reflect.Pointer {
-		return sig, false
+	if mtype.NumIn() == 2+offset {
+		sig.mode = modeUnary
+		return sig, true
 	}
 
-	if !mtype.Out(1).AssignableTo(errorType) {
+	/**/
+
+	streamIdx := offset + 2
+	arg := mtype.In(streamIdx)
+	switch {
+	case arg.AssignableTo(writerType):
+		sig.mode = modeServerStream
+		return sig, true
+	case arg.AssignableTo(readerType):
+		sig.mode = modeClientStream
+		return sig, true
+	default:
 		return sig, false
 	}
-
-	return sig, true
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -396,8 +456,499 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	switch m.mode {
+	case modeUnary:
+		h.serveUnary(w, r, m, codec, ctype)
+	case modeServerStream:
+		h.serveServerStream(w, r, m, codec, ctype)
+	case modeClientStream:
+		h.serveClientStream(w, r, m, codec, ctype)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (h *Handler) serveUnary(w http.ResponseWriter, r *http.Request, m *methodType, codec Codec, ctype string) {
 	req := reflect.New(m.rt)
 	if err := codec.Decode(r.Body, req.Interface()); err != nil {
+		w.Header().Set(ErrorHeader, err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if proto := r.Header.Get(ProtoHeader); proto == "N" || proto == "B" {
+		args := argPool.Get().(*[]reflect.Value)
+		(*args)[0] = reflect.ValueOf(context.WithoutCancel(r.Context()))
+		(*args)[1] = req
+		go func() {
+			if _, err := m.call(args, 2); err != nil {
+				log.Println("vrpc:", err)
+			}
+		}()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	args := argPool.Get().(*[]reflect.Value)
+	(*args)[0] = reflect.ValueOf(r.Context())
+	(*args)[1] = req
+
+	results, panicErr := m.call(args, 2)
+
+	h.sendUnaryResponse(w, codec, ctype, results, panicErr)
+}
+
+func (h *Handler) sendUnaryResponse(w http.ResponseWriter, codec Codec, ctype string, results []reflect.Value, err error) {
+
+	if err != nil {
+		w.Header().Set(ErrorHeader, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if errValue := results[1].Interface(); errValue != nil {
+		w.Header().Set(ErrorHeader, errValue.(error).Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	res := results[0].Interface()
+
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
+
+	if err = codec.Encode(buf, res); err != nil {
+		w.Header().Set(ErrorHeader, err.Error())
+		w.WriteHeader(StatusEncodingError)
+		return
+	}
+
+	w.Header().Set("Content-Type", ctype)
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
+}
+
+/**/
+
+const (
+	mEnd byte = iota
+	mMsg
+	mBin
+	mPing
+	mError
+)
+
+type framedIO struct {
+	enc Encoder
+	dec Decoder
+
+	// msgpackEncoder *msgpack.Encoder
+	// msgpackDecoder *msgpack.Decoder
+
+	writeBuf *bufio.Writer
+	flusher  http.Flusher
+
+	readBuf []byte
+	readPos int
+
+	// framedIO is not generally thread-safe:
+	// writes must be performed from a single goroutine
+	//
+	// but internally, it may write concurrently from a ping goroutine,
+	// this internal concurrency is synchronized by this mu
+	//
+	// fio.mu.Lock  - ping
+	// fio.mu.RLock - all others
+	mu sync.RWMutex
+
+	activity atomic.Int64 // unixnano
+	flushed  atomic.Bool
+	closed   atomic.Bool
+
+	stop    chan struct{}
+	stopped sync.WaitGroup
+}
+
+var fioPool = sync.Pool{
+	New: func() any {
+		return &framedIO{
+			readBuf:  make([]byte, 0, 1<<10),
+			writeBuf: bufio.NewWriterSize(io.Discard, 32<<10),
+		}
+	},
+}
+
+func newFramedIO(codec Codec, w io.Writer, r io.Reader) *framedIO {
+	f := fioPool.Get().(*framedIO)
+	*f = framedIO{
+		writeBuf: f.writeBuf,
+		readBuf:  f.readBuf[:0],
+		readPos:  0,
+	}
+
+	if w != nil {
+		f.writeBuf.Reset(w)
+		enc := codec.NewEncoder(f.writeBuf)
+		// if mp, ok := enc.(*msgpack.Encoder); ok {
+		// 	f.msgpackEncoder = mp
+		// } else {
+		f.enc = enc
+		// }
+		f.flusher, _ = w.(http.Flusher)
+		f.activity.Store(time.Now().UnixNano())
+		f.stop = make(chan struct{})
+		f.startPing()
+	}
+	if r != nil {
+		dec := codec.NewDecoder(r)
+		// if mp, ok := dec.(*msgpack.Decoder); ok {
+		// 	f.msgpackDecoder = mp
+		// } else {
+		f.dec = dec
+		// }
+	}
+	return f
+}
+
+func (fio *framedIO) release() {
+	fio.closed.Store(true)
+	if fio.stop != nil {
+		close(fio.stop)
+		fio.stopped.Wait()
+		fio.stop = nil
+	}
+	fioPool.Put(fio)
+}
+
+func (fio *framedIO) updateActivity() {
+	fio.activity.Store(time.Now().UnixNano())
+}
+
+func (fio *framedIO) sendPing() error {
+	fio.mu.Lock()
+	defer fio.mu.Unlock()
+
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+
+	if err := fio.enc.Encode(mPing); err != nil {
+		fio.closed.Store(true)
+		return err
+	}
+	if err := fio.flush(); err != nil {
+		return err
+	}
+
+	fio.updateActivity()
+
+	return nil
+}
+
+func (fio *framedIO) sendError(err error) error {
+	if err == nil {
+		return nil
+	}
+	fio.mu.RLock()
+	defer fio.mu.RUnlock()
+
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	defer fio.closed.Store(true)
+
+	if e := fio.enc.Encode(mError); e != nil {
+		return e
+	}
+	if e := fio.enc.Encode(err.Error()); e != nil {
+		return e
+	}
+	if e := fio.flush(); e != nil {
+		return e
+	}
+
+	fio.updateActivity()
+
+	return nil
+}
+
+func (fio *framedIO) sendEnd() error {
+	fio.mu.RLock()
+	defer fio.mu.RUnlock()
+
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+
+	defer fio.closed.Store(true)
+
+	if err := fio.enc.Encode(mEnd); err != nil {
+		return err
+	}
+	if err := fio.flush(); err != nil {
+		return err
+	}
+
+	fio.updateActivity()
+
+	return nil
+}
+
+func (fio *framedIO) sendMsg(v any) error {
+	fio.mu.RLock()
+	defer fio.mu.RUnlock()
+
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+
+	if err := fio.enc.Encode(mMsg); err != nil {
+		fio.closed.Store(true)
+		return err
+	}
+	if err := fio.enc.Encode(v); err != nil {
+		fio.closed.Store(true)
+		return err
+	}
+	if err := fio.flush(); err != nil {
+		return err
+	}
+
+	fio.updateActivity()
+
+	return nil
+}
+
+func (fio *framedIO) sendBytes(b []byte) error {
+
+	fio.mu.RLock()
+	defer fio.mu.RUnlock()
+
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+
+	if err := fio.enc.Encode(mBin); err != nil {
+		fio.closed.Store(true)
+		return err
+	}
+	if err := fio.enc.Encode(b); err != nil {
+		fio.closed.Store(true)
+		return err
+	}
+
+	fio.updateActivity() // without flush (leave it to the user)
+
+	return nil
+}
+
+func (fio *framedIO) startPing() {
+	fio.stopped.Add(1)
+	go func() {
+		defer fio.stopped.Done()
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+			case <-fio.stop:
+				return
+			}
+			if fio.closed.Load() {
+				return
+			}
+			since := time.Since(time.Unix(0, fio.activity.Load()))
+			if !fio.flushed.Load() && since < 13*time.Second {
+				continue
+			}
+			if since < 4*time.Second {
+				continue
+			}
+			if err := fio.sendPing(); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+func (fio *framedIO) Flush() error {
+	fio.mu.RLock()
+	defer fio.mu.RUnlock()
+
+	return fio.flush()
+}
+
+func (fio *framedIO) flush() error {
+	if fio.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	if err := fio.writeBuf.Flush(); err != nil {
+		return err
+	}
+	if fio.flusher != nil {
+		fio.flusher.Flush()
+	}
+	fio.flushed.Store(true)
+
+	fio.updateActivity()
+
+	return nil
+}
+
+func (fio *framedIO) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if err := fio.sendBytes(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (fio *framedIO) Read(p []byte) (int, error) {
+	for {
+		// drain current chunk
+		if fio.readPos < len(fio.readBuf) {
+			n := copy(p, fio.readBuf[fio.readPos:])
+			fio.readPos += n
+			return n, nil
+		}
+
+		// read more
+		var marker byte
+		// if fio.msgpackDecoder != nil {
+		// 	var err error
+		// 	if marker, err = fio.msgpackDecoder.DecodeUint8(); err != nil {
+		// 		if errors.Is(err, io.EOF) {
+		// 			return 0, io.ErrUnexpectedEOF
+		// 		}
+		// 		return 0, err
+		// 	}
+		// } else
+		if err := fio.dec.Decode(&marker); err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0, io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
+
+		switch marker {
+		case mPing:
+			continue
+
+		case mBin:
+			fio.readBuf = fio.readBuf[:0]
+			if err := fio.dec.Decode(&fio.readBuf); err != nil {
+				if errors.Is(err, io.EOF) {
+					return 0, io.ErrUnexpectedEOF
+				}
+				return 0, err
+			}
+			fio.readPos = 0
+			// loop will drain
+
+		case mEnd:
+			return 0, io.EOF
+
+		case mError:
+			var s string
+			if err := fio.dec.Decode(&s); err != nil {
+				if errors.Is(err, io.EOF) {
+					return 0, io.ErrUnexpectedEOF
+				}
+				return 0, err
+			}
+			return 0, errors.New(s)
+
+		case mMsg:
+			return 0, &Error{"protocol error: unexpected message frame while reading binary"}
+
+		default:
+			return 0, &Error{"protocol error: unknown marker"}
+		}
+	}
+}
+
+func (h *Handler) serveServerStream(w http.ResponseWriter, r *http.Request, m *methodType, codec Codec, ctype string) {
+
+	req := reflect.New(m.rt)
+	if err := codec.Decode(r.Body, req.Interface()); err != nil {
+		w.Header().Set(ErrorHeader, err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", ctype)
+
+	out := newFramedIO(codec, w, nil)
+	defer out.release()
+
+	args := argPool.Get().(*[]reflect.Value)
+	(*args)[0] = reflect.ValueOf(r.Context())
+	(*args)[1] = req
+	(*args)[2] = reflect.ValueOf(out)
+
+	results, panicErr := m.call(args, 3)
+
+	if panicErr != nil {
+		if !out.flushed.Load() {
+			w.Header().Set(ErrorHeader, panicErr.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = out.sendError(panicErr)
+		return
+	}
+
+	if errValue := results[1].Interface(); errValue != nil {
+		err := errValue.(error)
+		if !out.flushed.Load() {
+			w.Header().Set(ErrorHeader, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = out.sendError(err)
+		return
+	}
+
+	if err := out.sendMsg(results[0].Interface()); err != nil {
+		_ = out.sendError(err)
+		return
+	}
+
+	_ = out.sendEnd()
+}
+
+func (h *Handler) serveClientStream(w http.ResponseWriter, r *http.Request, m *methodType, codec Codec, ctype string) {
+
+	in := newFramedIO(codec, nil, r.Body)
+	defer in.release()
+
+	var marker byte
+	if err := in.dec.Decode(&marker); err != nil {
+		w.Header().Set(ErrorHeader, err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	for marker == mPing {
+		if err := in.dec.Decode(&marker); err != nil {
+			w.Header().Set(ErrorHeader, err.Error())
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	if marker != mMsg {
+		w.Header().Set(ErrorHeader, "protocol error: expected message marker")
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	req := reflect.New(m.rt)
+	if err := in.dec.Decode(req.Interface()); err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -406,64 +957,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	args := argPool.Get().(*[]reflect.Value)
 	(*args)[0] = reflect.ValueOf(r.Context())
 	(*args)[1] = req
-	defer func() {
-		clear(*args)
-		argPool.Put(args)
-	}()
+	(*args)[2] = reflect.ValueOf(in)
 
-	if proto := r.Header.Get(ProtoHeader); proto == "N" || proto == "B" {
-		goArgs := argPool.Get().(*[]reflect.Value)
-		copy(*goArgs, *args)
-		(*goArgs)[0] = reflect.ValueOf(context.WithoutCancel(r.Context()))
-		go func(args *[]reflect.Value) {
-			defer func() {
-				if p := recover(); p != nil {
-					log.Println("vrpc: service handler panic:", p)
-				}
-				clear(*args)
-				argPool.Put(args)
-			}()
-			_ = m.fn.Call(*args)
-		}(goArgs)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	results, panicErr := m.call(args, 3)
 
-	results, err := func(args *[]reflect.Value) (results []reflect.Value, e error) {
-		defer func() {
-			if p := recover(); p != nil {
-				e = fmt.Errorf("service panic: %v", p)
-			}
-		}()
-		return m.fn.Call(*args), nil
-	}(args)
-	if err != nil {
-		w.Header().Set(ErrorHeader, err.Error())
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if errValue := results[1].Interface(); errValue != nil {
-		w.Header().Set(ErrorHeader, errValue.(error).Error())
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	rsp := results[0].Interface()
-
-	buf := bufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer bufferPool.Put(buf)
-
-	if err = codec.Encode(buf, rsp); err != nil {
-		w.Header().Set(ErrorHeader, err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", ctype)
-	w.WriteHeader(http.StatusOK)
-	_, _ = buf.WriteTo(w)
+	h.sendUnaryResponse(w, codec, ctype, results, panicErr)
 }
 
 // Mux is a multiplexer that routes requests to specific Handlers based on the service name.
@@ -694,6 +1192,227 @@ func NewClient(options ...ClientOption) (*Client, error) {
 	return c, nil
 }
 
+// ServerStream calls an RPC method that streams data from the server to the client.
+//
+// The server implementation receives an io.Writer and may write the streamed payload
+// to it. On the client side, all streamed bytes are forwarded into dst.
+//
+// Context cancellation aborts the request.
+// dst may observe a write error originating from request cancellation.
+//
+// dst receives bytes as they arrive, but actual network delivery depends
+// on server flushing. The server-side writer supports optional explicit Flush
+// to prioritize latency; otherwise buffering may increase throughput.
+//
+// Transport and protocol errors are returned as *vrpc.Error.
+// Service-level failures are returned as a regular error (not wrapped).
+//
+// If an error occurs, dst may have already received a prefix of the stream.
+func (c *Client) ServerStream(ctx context.Context, service, method string, request any, dst io.Writer, response any) error {
+
+	buf := new(bytes.Buffer) // do not pool here (transport may still read on http/2)
+
+	if err := c.codec.Encode(buf, request); err != nil {
+		return &Error{"error encoding request: " + err.Error()}
+	}
+	req := c.newRequest(ctx, service, method)
+	req.Body = io.NopCloser(buf)
+	req.ContentLength = int64(buf.Len())
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return &Error{"request error: " + err.Error()}
+	}
+	defer func() { _ = res.Body.Close() }()
+	defer func() { _, _ = io.Copy(io.Discard, res.Body) }()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+
+		in := newFramedIO(c.codec, nil, res.Body) // bufio.NewReader(res.Body), 0)
+		defer in.release()
+
+		var b []byte
+		for {
+			var marker byte
+			if e := in.dec.Decode(&marker); e != nil {
+				return &Error{"error decoding stream marker: " + e.Error()}
+			}
+			switch marker {
+
+			case mPing:
+				continue
+
+			case mBin:
+				b = b[:0]
+				if e := in.dec.Decode(&b); e != nil {
+					return &Error{"error decoding binary chunk: " + e.Error()}
+				}
+				if _, e := dst.Write(b); e != nil {
+					return e
+				}
+
+			case mMsg:
+				if e := in.dec.Decode(response); e != nil {
+					return &Error{"error decoding final response: " + e.Error()}
+				}
+
+			case mEnd:
+				return nil
+
+			case mError:
+				var s string
+				if e := in.dec.Decode(&s); e != nil {
+					return &Error{"error decoding error message: " + e.Error()}
+				}
+				return errors.New(s)
+
+			default:
+				return &Error{"protocol error: unknown marker"}
+			}
+		}
+
+	case http.StatusUnsupportedMediaType:
+		return ErrNoCodec
+
+	case http.StatusNotFound:
+		return ErrNotFound
+
+	case http.StatusBadRequest:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return &Error{"server failed to decode the request: " + errText}
+		}
+		return &Error{"server failed to decode the request but did not provide any error"}
+
+	case http.StatusInternalServerError:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return errors.New(errText) // service error
+		}
+		return &Error{"server returned 500 without error header"}
+
+	case StatusEncodingError:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return &Error{"server failed to encode response: " + errText}
+		}
+		return &Error{"server failed to encode response but did not provide any error"}
+
+	default:
+		return &Error{"unknown error"}
+	}
+}
+
+// ClientStream calls an RPC method that streams data from the client to the server.
+//
+// Server implementation receives an io.Reader and may read the stream until EOF,
+// then returns a regular unary response which is decoded into response.
+//
+// End-of-stream is signaled by src returning io.EOF.
+// If you want to stream data incrementally (e.g. transfer objects),
+// use an io.Pipe (or a custom io.Reader) and close the writer side to signal EOF.
+//
+// Context cancellation aborts the request. The upload goroutine will eventually
+// stop when the request is torn down; src may observe read errors.
+//
+// The upload path is buffered; explicit flushing is not exposed.
+//
+// Transport and protocol errors are returned as *vrpc.Error.
+// Service-level failures are returned as a regular error (not wrapped).
+// On upload errors, the returned error reflects the upload failure even if the
+// server already replied (best-effort error propagation).
+func (c *Client) ClientStream(ctx context.Context, service, method string, request any, src io.Reader, response any) error {
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	defer func() { _ = pw.Close() }()
+
+	errCh := make(chan error, 1)
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	go func() {
+		defer close(errCh)
+		defer func() { _ = pw.Close() }()
+
+		out := newFramedIO(c.codec, pw, nil)
+		defer out.release()
+
+		done := streamCtx.Done()
+
+		if err := out.sendMsg(request); err != nil {
+			_ = pw.CloseWithError(err)
+			select {
+			case errCh <- err:
+			case <-done:
+			}
+			return
+		}
+
+		if _, err := io.Copy(out, src); err != nil {
+			_ = out.sendError(err) // best effort
+			_ = pw.CloseWithError(err)
+			select {
+			case errCh <- err:
+			case <-done:
+			}
+			return
+		}
+
+		select {
+		case errCh <- out.sendEnd():
+		case <-done:
+		}
+	}()
+
+	req := c.newRequest(ctx, service, method)
+	req.Body = pr // io.NopCloser(pr)
+	req.ContentLength = -1
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return &Error{"request error: " + err.Error()}
+	}
+	defer func() { _ = res.Body.Close() }()
+	defer func() { _, _ = io.Copy(io.Discard, res.Body) }()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+		if err = c.codec.Decode(res.Body, response); err != nil {
+			return &Error{"error decoding response: " + err.Error()}
+		}
+		if err = <-errCh; err != nil {
+			return &Error{"error uploading request body: " + err.Error()}
+		}
+		return nil
+
+	case http.StatusUnsupportedMediaType:
+		return ErrNoCodec
+
+	case http.StatusNotFound:
+		return ErrNotFound
+
+	case http.StatusBadRequest:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return &Error{"server failed to decode the request: " + errText}
+		}
+		return &Error{"server failed to decode the request but did not provide any error"}
+
+	case http.StatusInternalServerError:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return errors.New(errText)
+		}
+		return &Error{"server returned 500 without error header"}
+
+	case StatusEncodingError:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return &Error{"server failed to encode response: " + errText}
+		}
+		return &Error{"server failed to encode response but did not provide any error"}
+
+	default:
+		return &Error{"unknown error"}
+	}
+}
+
 // Call is a generic helper function that invokes a method on the Client
 // and returns result as *T.
 func Call[T any](c *Client, ctx context.Context, service, method string, req any) (*T, error) {
@@ -715,7 +1434,7 @@ func CallFor[S any, T any](c *Client, ctx context.Context, method string, req an
 	return res, nil
 }
 
-// Call invokes a synchronous RPC method.
+// Call executes a synchronous RPC method.
 // It sends the request, waits for the server to process it, and decodes the body into the response.
 func (c *Client) Call(ctx context.Context, service, method string, request any, response any) error {
 	return c.call(ctx, service, method, request, response, "")
@@ -733,16 +1452,21 @@ func (c *Client) Beacon(ctx context.Context, service, method string, request any
 	return c.call(ctx, service, method, request, nil, "B")
 }
 
+type AAA struct {
+	*bytes.Buffer
+}
+
 func (c *Client) call(ctx context.Context, service, method string, request any, response any, rType string) error {
 
-	buf := bufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
+	buf := new(bytes.Buffer) // do not pool here (transport may still read on http/2)
 
 	if err := c.codec.Encode(buf, request); err != nil {
-		bufferPool.Put(buf)
 		return &Error{"error encoding request: " + err.Error()}
 	}
-	req := c.newRequest(ctx, service, method, buf)
+
+	req := c.newRequest(ctx, service, method)
+	req.Body = io.NopCloser(buf)
+	req.ContentLength = int64(buf.Len())
 
 	if rType != "" {
 		req.Header.Set(ProtoHeader, rType)
@@ -750,34 +1474,29 @@ func (c *Client) call(ctx context.Context, service, method string, request any, 
 
 	if rType == "B" {
 		req = req.WithContext(context.WithoutCancel(req.Context()))
-		go func(req *http.Request, buf *bytes.Buffer) {
-			defer bufferPool.Put(buf)
+		go func(req *http.Request) {
 			res, err := c.client.Do(req)
 			if err != nil {
 				return
 			}
-			defer func(res *http.Response) { _ = res.Body.Close() }(res)
-			defer func(res *http.Response) { _, _ = io.Copy(io.Discard, res.Body) }(res)
-		}(req, buf)
+			defer func() { _ = res.Body.Close() }()
+			defer func() { _, _ = io.Copy(io.Discard, res.Body) }()
+		}(req)
 		return nil
 	}
-	defer bufferPool.Put(buf)
 
 	res, err := c.client.Do(req)
 	if err != nil {
 		return &Error{"request error: " + err.Error()}
 	}
-	defer func(res *http.Response) { _ = res.Body.Close() }(res)
-	defer func(res *http.Response) { _, _ = io.Copy(io.Discard, res.Body) }(res)
+	defer func() { _ = res.Body.Close() }()
+	defer func() { _, _ = io.Copy(io.Discard, res.Body) }()
 
 	switch res.StatusCode {
 
 	case http.StatusOK:
 		if rType == "N" {
 			return nil
-		}
-		if errText := res.Header.Get(ErrorHeader); errText != "" {
-			return errors.New(errText)
 		}
 		if err = c.codec.Decode(res.Body, response); err != nil {
 			return &Error{"error decoding response: " + err.Error()}
@@ -798,16 +1517,22 @@ func (c *Client) call(ctx context.Context, service, method string, request any, 
 
 	case http.StatusInternalServerError:
 		if errText := res.Header.Get(ErrorHeader); errText != "" {
-			return &Error{"server failed to encode the response: " + errText}
+			return errors.New(errText)
 		}
-		return &Error{"server failed to encode the response but did not provide any error"}
+		return &Error{"server returned 500 without error header"}
+
+	case StatusEncodingError:
+		if errText := res.Header.Get(ErrorHeader); errText != "" {
+			return &Error{"server failed to encode response: " + errText}
+		}
+		return &Error{"server failed to encode response but did not provide any error"}
 
 	default:
 		return &Error{"unknown error"}
 	}
 }
 
-func (c *Client) newRequest(ctx context.Context, service, method string, body *bytes.Buffer) *http.Request {
+func (c *Client) newRequest(ctx context.Context, service, method string) *http.Request {
 	req := defaultRequest.WithContext(ctx)
 
 	u := c.base
@@ -826,10 +1551,7 @@ func (c *Client) newRequest(ctx context.Context, service, method string, body *b
 	req.Header = http.Header{
 		"Content-Type": c.ctype,
 	}
-
 	req.URL = &u
-	req.Body = io.NopCloser(body)
-	req.ContentLength = int64(body.Len())
 
 	// buf := body.Bytes()
 	// req.GetBody = func() (io.ReadCloser, error) {
