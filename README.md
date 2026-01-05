@@ -3,14 +3,14 @@
 [![GoDoc](https://godoc.org/github.com/vapstack/vrpc?status.svg)](https://godoc.org/github.com/vapstack/vrpc)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/vrpc/master/LICENSE)
 
-A very basic RPC framework for Go running over standard HTTP.
+RPC framework for Go running over standard HTTP.
 
 - No code generation.
 - Built on top of standard `net/http` without manual connection management.
 - Compatible with standard proxies, balancers and service mesh environments.
 - Contracts are defined using standard Go structs and methods.
 - Service name can be derived from the generic type argument or from implementation type.
-- Supports synchronous calls and asynchronous notifications.
+- Supports synchronous calls, asynchronous notifications and streaming from any side.
 - Pluggable codecs (selected by `Content-Type`).\
   JSON, gob and [msgpack](https://github.com/vmihailenco/msgpack) are supported out of the box.
 - Client uses msgpack by default.
@@ -126,7 +126,6 @@ interface { Flush() error }
 Calling `Flush` forces buffered data to be sent immediately.
 Otherwise, data may be buffered to improve throughput.
 With frequent `Flush`, latency is minimized at the cost of throughput.
-
 The choice is left to the service implementation.
 
 On the client side, server streaming is consumed using:
@@ -237,8 +236,8 @@ func main() {
 cpu: AMD Ryzen 9 5900HX with Radeon Graphics
 BenchmarkVRPC_Call_HTTP-16          13016     90857 ns/op     15604 B/op    86 allocs/op
 BenchmarkNetRPC_Call_HTTP-16        25706     46758 ns/op       496 B/op    15 allocs/op
-BenchmarkVRPC_Call_Direct-16       205393      5643 ns/op     10944 B/op    31 allocs/op
-BenchmarkNetRPC_Call_Direct-16     156754      7677 ns/op       514 B/op    16 allocs/op
+BenchmarkVRPC_Call_InProc-16       205393      5643 ns/op     10944 B/op    31 allocs/op
+BenchmarkNetRPC_Call_InProc-16     156754      7677 ns/op       514 B/op    16 allocs/op
 ```
 It's almost twice as slow as `net/rpc`. Most allocations come from `net/http`.
 

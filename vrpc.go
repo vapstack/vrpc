@@ -543,8 +543,8 @@ type framedIO struct {
 	enc Encoder
 	dec Decoder
 
-	// msgpackEncoder *msgpack.Encoder
-	// msgpackDecoder *msgpack.Decoder
+	msgpackEncoder *msgpack.Encoder
+	msgpackDecoder *msgpack.Decoder
 
 	writeBuf *bufio.Writer
 	flusher  http.Flusher
@@ -573,7 +573,7 @@ type framedIO struct {
 var fioPool = sync.Pool{
 	New: func() any {
 		return &framedIO{
-			readBuf:  make([]byte, 0, 1<<10),
+			readBuf:  make([]byte, 0, 4<<10),
 			writeBuf: bufio.NewWriterSize(io.Discard, 32<<10),
 		}
 	},
@@ -590,11 +590,10 @@ func newFramedIO(codec Codec, w io.Writer, r io.Reader) *framedIO {
 	if w != nil {
 		f.writeBuf.Reset(w)
 		enc := codec.NewEncoder(f.writeBuf)
-		// if mp, ok := enc.(*msgpack.Encoder); ok {
-		// 	f.msgpackEncoder = mp
-		// } else {
+		if mp, ok := enc.(*msgpack.Encoder); ok {
+			f.msgpackEncoder = mp
+		}
 		f.enc = enc
-		// }
 		f.flusher, _ = w.(http.Flusher)
 		f.activity.Store(time.Now().UnixNano())
 		f.stop = make(chan struct{})
@@ -602,13 +601,51 @@ func newFramedIO(codec Codec, w io.Writer, r io.Reader) *framedIO {
 	}
 	if r != nil {
 		dec := codec.NewDecoder(r)
-		// if mp, ok := dec.(*msgpack.Decoder); ok {
-		// 	f.msgpackDecoder = mp
-		// } else {
+		if mp, ok := dec.(*msgpack.Decoder); ok {
+			f.msgpackDecoder = mp
+		}
 		f.dec = dec
-		// }
 	}
 	return f
+}
+
+func (fio *framedIO) decodeMarker() (byte, error) {
+	if fio.msgpackDecoder != nil {
+		return fio.msgpackDecoder.DecodeUint8()
+	}
+	var marker byte
+	err := fio.dec.Decode(&marker)
+	return marker, err
+}
+
+func (fio *framedIO) decodeString() (string, error) {
+	if fio.msgpackDecoder != nil {
+		return fio.msgpackDecoder.DecodeString()
+	}
+	var s string
+	err := fio.dec.Decode(&s)
+	return s, err
+}
+
+func (fio *framedIO) encodeMarker(marker byte) error {
+	if fio.msgpackEncoder != nil {
+		return fio.msgpackEncoder.EncodeUint8(marker)
+	}
+	return fio.enc.Encode(marker)
+}
+
+func (fio *framedIO) encodeBytes(b []byte) error {
+	if fio.msgpackEncoder != nil {
+		return fio.msgpackEncoder.EncodeBytes(b)
+	}
+	return fio.enc.Encode(b)
+}
+
+func (fio *framedIO) encodeString(v string) error {
+	if fio.msgpackEncoder != nil {
+		return fio.msgpackEncoder.EncodeString(v)
+	}
+	return fio.enc.Encode(v)
 }
 
 func (fio *framedIO) release() {
@@ -633,7 +670,7 @@ func (fio *framedIO) sendPing() error {
 		return io.ErrClosedPipe
 	}
 
-	if err := fio.enc.Encode(mPing); err != nil {
+	if err := fio.encodeMarker(mPing); err != nil {
 		fio.closed.Store(true)
 		return err
 	}
@@ -658,10 +695,10 @@ func (fio *framedIO) sendError(err error) error {
 	}
 	defer fio.closed.Store(true)
 
-	if e := fio.enc.Encode(mError); e != nil {
+	if e := fio.encodeMarker(mError); e != nil {
 		return e
 	}
-	if e := fio.enc.Encode(err.Error()); e != nil {
+	if e := fio.encodeString(err.Error()); e != nil {
 		return e
 	}
 	if e := fio.flush(); e != nil {
@@ -683,7 +720,7 @@ func (fio *framedIO) sendEnd() error {
 
 	defer fio.closed.Store(true)
 
-	if err := fio.enc.Encode(mEnd); err != nil {
+	if err := fio.encodeMarker(mEnd); err != nil {
 		return err
 	}
 	if err := fio.flush(); err != nil {
@@ -703,7 +740,7 @@ func (fio *framedIO) sendMsg(v any) error {
 		return io.ErrClosedPipe
 	}
 
-	if err := fio.enc.Encode(mMsg); err != nil {
+	if err := fio.encodeMarker(mMsg); err != nil {
 		fio.closed.Store(true)
 		return err
 	}
@@ -729,11 +766,11 @@ func (fio *framedIO) sendBytes(b []byte) error {
 		return io.ErrClosedPipe
 	}
 
-	if err := fio.enc.Encode(mBin); err != nil {
+	if err := fio.encodeMarker(mBin); err != nil {
 		fio.closed.Store(true)
 		return err
 	}
-	if err := fio.enc.Encode(b); err != nil {
+	if err := fio.encodeBytes(b); err != nil {
 		fio.closed.Store(true)
 		return err
 	}
@@ -817,17 +854,8 @@ func (fio *framedIO) Read(p []byte) (int, error) {
 		}
 
 		// read more
-		var marker byte
-		// if fio.msgpackDecoder != nil {
-		// 	var err error
-		// 	if marker, err = fio.msgpackDecoder.DecodeUint8(); err != nil {
-		// 		if errors.Is(err, io.EOF) {
-		// 			return 0, io.ErrUnexpectedEOF
-		// 		}
-		// 		return 0, err
-		// 	}
-		// } else
-		if err := fio.dec.Decode(&marker); err != nil {
+		marker, err := fio.decodeMarker()
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return 0, io.ErrUnexpectedEOF
 			}
@@ -840,7 +868,8 @@ func (fio *framedIO) Read(p []byte) (int, error) {
 
 		case mBin:
 			fio.readBuf = fio.readBuf[:0]
-			if err := fio.dec.Decode(&fio.readBuf); err != nil {
+			// msgpack reuses slice only if called via Decode (not DecodeBytes)
+			if err = fio.dec.Decode(&fio.readBuf); err != nil {
 				if errors.Is(err, io.EOF) {
 					return 0, io.ErrUnexpectedEOF
 				}
@@ -853,8 +882,8 @@ func (fio *framedIO) Read(p []byte) (int, error) {
 			return 0, io.EOF
 
 		case mError:
-			var s string
-			if err := fio.dec.Decode(&s); err != nil {
+			s, err := fio.decodeString()
+			if err != nil {
 				if errors.Is(err, io.EOF) {
 					return 0, io.ErrUnexpectedEOF
 				}
@@ -926,15 +955,15 @@ func (h *Handler) serveClientStream(w http.ResponseWriter, r *http.Request, m *m
 	in := newFramedIO(codec, nil, r.Body)
 	defer in.release()
 
-	var marker byte
-	if err := in.dec.Decode(&marker); err != nil {
+	marker, err := in.decodeMarker()
+	if err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	for marker == mPing {
-		if err := in.dec.Decode(&marker); err != nil {
+		if marker, err = in.decodeMarker(); err != nil {
 			w.Header().Set(ErrorHeader, err.Error())
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -948,7 +977,7 @@ func (h *Handler) serveClientStream(w http.ResponseWriter, r *http.Request, m *m
 	}
 
 	req := reflect.New(m.rt)
-	if err := in.dec.Decode(req.Interface()); err != nil {
+	if err = in.dec.Decode(req.Interface()); err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -1229,13 +1258,13 @@ func (c *Client) ServerStream(ctx context.Context, service, method string, reque
 	switch res.StatusCode {
 	case http.StatusOK:
 
-		in := newFramedIO(c.codec, nil, res.Body) // bufio.NewReader(res.Body), 0)
+		in := newFramedIO(c.codec, nil, res.Body)
 		defer in.release()
 
-		var b []byte
+		b := make([]byte, 0, 512)
 		for {
-			var marker byte
-			if e := in.dec.Decode(&marker); e != nil {
+			marker, e := in.decodeMarker()
+			if e != nil {
 				return &Error{"error decoding stream marker: " + e.Error()}
 			}
 			switch marker {
@@ -1245,15 +1274,15 @@ func (c *Client) ServerStream(ctx context.Context, service, method string, reque
 
 			case mBin:
 				b = b[:0]
-				if e := in.dec.Decode(&b); e != nil {
+				if e = in.dec.Decode(&b); e != nil {
 					return &Error{"error decoding binary chunk: " + e.Error()}
 				}
-				if _, e := dst.Write(b); e != nil {
+				if _, e = dst.Write(b); e != nil {
 					return e
 				}
 
 			case mMsg:
-				if e := in.dec.Decode(response); e != nil {
+				if e = in.dec.Decode(response); e != nil {
 					return &Error{"error decoding final response: " + e.Error()}
 				}
 
@@ -1261,8 +1290,8 @@ func (c *Client) ServerStream(ctx context.Context, service, method string, reque
 				return nil
 
 			case mError:
-				var s string
-				if e := in.dec.Decode(&s); e != nil {
+				s, e := in.decodeString()
+				if e != nil {
 					return &Error{"error decoding error message: " + e.Error()}
 				}
 				return errors.New(s)

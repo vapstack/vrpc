@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/rpc"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -150,65 +151,6 @@ func TestBeacon(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
-
-/*
-type rtCapture struct {
-	got atomic.Pointer[bodyBuffer]
-}
-
-func (rt *rtCapture) RoundTrip(req *http.Request) (*http.Response, error) {
-	if bb, ok := req.Body.(*bodyBuffer); ok {
-		rt.got.Store(bb)
-	}
-	return nil, errors.New("do error")
-}
-
-func TestBeacon_DoError_ClosesRequestBody(t *testing.T) {
-	rt := &rtCapture{}
-	hc := &http.Client{Transport: rt}
-
-	c, err := NewClient(
-		WithEndpoint("http://example.invalid"),
-		WithClient(hc),
-	)
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	err = c.Beacon(context.Background(), "MathService", "Add", &Request{A: 1, B: 2})
-	if err != nil {
-		t.Fatalf("Beacon unexpected error: %v", err)
-	}
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		// if rt.gotBody != nil && rt.gotBody.buf == nil {
-		// 	return // ok: close called, buffer returned
-		// }
-		bb := rt.got.Load()
-		if bb != nil {
-			bb.mu.RLock()
-			closed := bb.buf == nil
-			bb.mu.RUnlock()
-			if closed {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	bb := rt.got.Load()
-	if bb != nil {
-		bb.mu.RLock()
-		defer bb.mu.RUnlock()
-		if bb.buf == nil {
-			return
-		}
-	}
-	if bb == nil {
-		t.Fatal("RoundTripper did not observe request body")
-	}
-	t.Fatalf("expected request body to be closed (buf=nil)")
-}
-*/
 
 func TestRace(t *testing.T) {
 	_, server := setupServer(t)
@@ -1395,50 +1337,6 @@ func TestFramedIO_NewFramedIO_WithNilWriter_DoesNotStartPingOrPanicOnRelease(t *
 	f.release()
 }
 
-/*
-	func TestBodyBuffer_ReadConcurrentWithClose_DoesNotPanic(t *testing.T) {
-		bb := getBodyBuffer()
-		_, _ = bb.Write(bytes.Repeat([]byte("a"), 64<<10))
-
-		start := make(chan struct{})
-		done := make(chan struct{})
-
-		go func() {
-			defer close(done)
-			<-start
-			buf := make([]byte, 1024)
-			for i := 0; i < 1000; i++ {
-				_, _ = bb.Read(buf)
-			}
-		}()
-
-		close(start)
-		time.Sleep(1 * time.Millisecond)
-		_ = bb.Close()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			t.Fatal("reader goroutine did not finish; potential deadlock")
-		}
-	}
-
-	func TestBodyBuffer_AfterClose_ReturnsErrClosedPipe(t *testing.T) {
-		bb := getBodyBuffer()
-		if err := bb.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if _, err := bb.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
-			t.Fatalf("Write after Close: expected io.ErrClosedPipe, got %v", err)
-		}
-		if _, err := bb.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
-			t.Fatalf("Read after Close: expected io.ErrClosedPipe, got %v", err)
-		}
-		if bb.Len() != 0 {
-			t.Fatalf("Len after Close: expected 0, got %d", bb.Len())
-		}
-	}
-*/
 func TestFramedIO_Flush_NoHTTPFlusher_DoesNotPanic(t *testing.T) {
 	tc := &testCodec{}
 	w := &nopWriteCloser{}
@@ -1514,162 +1412,12 @@ func TestFramedIO_Flush_ReturnsErrorOnUnderlyingWriteError(t *testing.T) {
 
 /**/
 
-func BenchmarkVRPC_Call_HTTP(b *testing.B) {
-	svc := new(MathService)
-	handler := Def[MathService](svc)
-
-	mux, err := NewMux(handler)
-	if err != nil {
-		b.Fatal(err)
-	}
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	client, err := NewClient(WithEndpoint(server.URL))
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	req := &Request{A: 1, B: 2}
-	ctx := context.Background()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		res := new(Response)
-		err = client.Call(ctx, "MathService", "Add", req, res)
-		// _, err = CallFor[MathService, Response](client, ctx, "Add", req)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 type RPCMathService struct{}
 
 func (s *RPCMathService) Add(req *Request, resp *Response) error {
 	resp.Sum = req.A + req.B
 	return nil
 }
-
-func setupNetRPCHTTP(b *testing.B) (addr string, closeFn func()) {
-	b.Helper()
-
-	srv := rpc.NewServer()
-	if err := srv.RegisterName("MathService", new(RPCMathService)); err != nil {
-		b.Fatal(err)
-	}
-
-	mux := http.NewServeMux()
-	mux.Handle(rpc.DefaultRPCPath, srv)
-	mux.Handle(rpc.DefaultDebugPath, srv)
-
-	ts := httptest.NewServer(mux)
-	return ts.Listener.Addr().String(), ts.Close
-}
-
-func BenchmarkNetRPC_Call_HTTP(b *testing.B) {
-	addr, closeServer := setupNetRPCHTTP(b)
-	defer closeServer()
-
-	client, err := rpc.DialHTTP("tcp", addr)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer func() { _ = client.Close() }()
-
-	req := &Request{A: 1, B: 2}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		res := new(Response)
-		if err = client.Call("MathService.Add", req, res); err != nil {
-			b.Fatal(err)
-		}
-		if res.Sum != 3 {
-			b.Fatalf("bad sum: %d", res.Sum)
-		}
-	}
-}
-
-func BenchmarkVRPC_Call_Direct(b *testing.B) {
-	svc := new(MathService)
-	h := Def[MathService](svc)
-
-	codec := msgpackCodec{}
-
-	buf := new(bytes.Buffer)
-	if err := codec.Encode(buf, &Request{A: 1, B: 2}); err != nil {
-		b.Fatal(err)
-	}
-	body := buf.Bytes()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/MathService/Add", bytes.NewReader(body))
-		r = r.WithContext(context.Background())
-		r.Header.Set("Content-Type", codec.ContentType())
-
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-
-		if w.Code != http.StatusOK {
-			b.Fatalf("status: %d", w.Code)
-		}
-		if err := w.Header().Get(ErrorHeader); err != "" {
-			b.Fatalf("err header: %s", err)
-		}
-	}
-}
-
-func dialRPC(b *testing.B) (*rpc.Client, func()) {
-	b.Helper()
-
-	serverConn, clientConn := net.Pipe()
-
-	srv := rpc.NewServer()
-	if err := srv.RegisterName("MathService", new(RPCMathService)); err != nil {
-		_ = serverConn.Close()
-		_ = clientConn.Close()
-		b.Fatal(err)
-	}
-
-	go srv.ServeConn(serverConn)
-
-	c := rpc.NewClient(clientConn)
-
-	return c, func() {
-		_ = c.Close()
-		_ = serverConn.Close()
-	}
-}
-
-func BenchmarkNetRPC_Call_Direct(b *testing.B) {
-	client, closeFn := dialRPC(b)
-	defer closeFn()
-
-	req := &Request{A: 1, B: 2}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		res := new(Response)
-		if err := client.Call("MathService.Add", req, &res); err != nil {
-			b.Fatal(err)
-		}
-		if res.Sum != 3 {
-			b.Fatalf("bad sum: %d", res.Sum)
-		}
-	}
-}
-
-/**/
 
 type StreamBenchService struct{}
 
@@ -1746,18 +1494,72 @@ func (s *StreamBenchService) Upload(ctx context.Context, req *Request, r io.Read
 	return &Response{Sum: req.A + req.B}, nil
 }
 
-func setupStreamBenchServer(b *testing.B) (*httptest.Server, *Client) {
-	b.Helper()
+type benchRW struct {
+	hdr http.Header
+	dst io.Writer
+	buf bytes.Buffer
 
-	svc := new(StreamBenchService)
-	h := Def[StreamBenchService](svc)
-	mux, err := NewMux(h)
-	if err != nil {
-		b.Fatal(err)
+	status int
+}
+
+func (w *benchRW) Reset(dst io.Writer, bufCap int) {
+	if w.hdr == nil {
+		w.hdr = make(http.Header, 8)
+	}
+	for k := range w.hdr {
+		delete(w.hdr, k)
+	}
+	w.status = 0
+	w.dst = dst
+	w.buf.Reset()
+	if bufCap > 0 {
+		w.buf.Grow(bufCap)
+	}
+}
+
+func (w *benchRW) Header() http.Header  { return w.hdr }
+func (w *benchRW) WriteHeader(code int) { w.status = code }
+func (w *benchRW) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if w.dst != nil {
+		return w.dst.Write(p)
+	}
+	return w.buf.Write(p)
+}
+func (w *benchRW) Flush() {}
+
+type inprocTransport struct {
+	h  http.Handler
+	rw *benchRW
+	mu sync.Mutex
+}
+
+func (t *inprocTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.rw.Reset(nil, int(req.ContentLength)+256)
+	t.h.ServeHTTP(t.rw, req)
+
+	if t.rw.status == 0 {
+		t.rw.status = http.StatusOK
 	}
 
-	ts := httptest.NewServer(mux)
+	body := append([]byte(nil), t.rw.buf.Bytes()...)
+	return &http.Response{
+		StatusCode:    t.rw.status,
+		Header:        t.rw.hdr.Clone(),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
 
+func setupVRPCHTTPUnary(b *testing.B) (*httptest.Server, *Client) {
+	b.Helper()
+	ts := httptest.NewServer(Def[MathService](new(MathService)))
 	c, err := NewClient(WithEndpoint(ts.URL))
 	if err != nil {
 		ts.Close()
@@ -1766,8 +1568,164 @@ func setupStreamBenchServer(b *testing.B) (*httptest.Server, *Client) {
 	return ts, c
 }
 
-func BenchmarkVRPC_ServerStream_HTTP_Throughput_8MiB_32KiB(b *testing.B) {
-	ts, c := setupStreamBenchServer(b)
+func setupNetRPCHTTPUnary(b *testing.B) (*httptest.Server, *rpc.Client) {
+	b.Helper()
+
+	srv := rpc.NewServer()
+	if err := srv.RegisterName("MathService", new(RPCMathService)); err != nil {
+		b.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle(rpc.DefaultRPCPath, srv)
+
+	ts := httptest.NewServer(mux)
+
+	cli, err := rpc.DialHTTP("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		ts.Close()
+		b.Fatal(err)
+	}
+	return ts, cli
+}
+
+func setupVRPCDirectUnary(b *testing.B) *Client {
+	b.Helper()
+
+	c, err := NewClient(
+		WithClient(&http.Client{
+			Transport: &inprocTransport{
+				h:  Def[MathService](new(MathService)),
+				rw: &benchRW{},
+			},
+		}),
+		WithEndpoint("http://inproc"), // ignored
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return c
+}
+
+func setupNetRPCDirectPipe(b *testing.B) (*rpc.Client, func()) {
+	b.Helper()
+
+	serverConn, clientConn := net.Pipe()
+
+	srv := rpc.NewServer()
+	if err := srv.RegisterName("MathService", new(RPCMathService)); err != nil {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+		b.Fatal(err)
+	}
+
+	go srv.ServeConn(serverConn)
+	cli := rpc.NewClient(clientConn)
+
+	closeFn := func() {
+		_ = cli.Close()
+		_ = serverConn.Close()
+	}
+	return cli, closeFn
+}
+
+func setupVRPCStreamHTTP(b *testing.B) (*httptest.Server, *Client) {
+	b.Helper()
+	ts := httptest.NewServer(Def[StreamBenchService](new(StreamBenchService)))
+	c, err := NewClient(WithEndpoint(ts.URL))
+	if err != nil {
+		ts.Close()
+		b.Fatal(err)
+	}
+	return ts, c
+}
+
+func BenchmarkVRPC_Call_HTTP(b *testing.B) {
+	ts, c := setupVRPCHTTPUnary(b)
+	defer ts.Close()
+
+	req := &Request{A: 1, B: 2}
+	res := new(Response)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		*res = Response{}
+		if err := c.Call(context.Background(), "MathService", "Add", req, res); err != nil {
+			b.Fatal(err)
+		}
+		if res.Sum != 3 {
+			b.Fatalf("bad sum: %d", res.Sum)
+		}
+	}
+}
+
+func BenchmarkNetRPC_Call_HTTP(b *testing.B) {
+	ts, c := setupNetRPCHTTPUnary(b)
+	defer ts.Close()
+	defer c.Close()
+
+	req := &Request{A: 1, B: 2}
+	res := new(Response)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		*res = Response{}
+		if err := c.Call("MathService.Add", req, res); err != nil {
+			b.Fatal(err)
+		}
+		if res.Sum != 3 {
+			b.Fatalf("bad sum: %d", res.Sum)
+		}
+	}
+}
+
+func BenchmarkVRPC_Call_InProc(b *testing.B) {
+	c := setupVRPCDirectUnary(b)
+
+	req := &Request{A: 1, B: 2}
+	res := new(Response)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		*res = Response{}
+		if err := c.Call(context.Background(), "MathService", "Add", req, res); err != nil {
+			b.Fatal(err)
+		}
+		if res.Sum != 3 {
+			b.Fatalf("bad sum: %d", res.Sum)
+		}
+	}
+}
+
+func BenchmarkNetRPC_Call_InProc(b *testing.B) {
+	c, closeFn := setupNetRPCDirectPipe(b)
+	defer closeFn()
+
+	req := &Request{A: 1, B: 2}
+	res := new(Response)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		*res = Response{}
+		if err := c.Call("MathService.Add", req, res); err != nil {
+			b.Fatal(err)
+		}
+		if res.Sum != 3 {
+			b.Fatalf("bad sum: %d", res.Sum)
+		}
+	}
+}
+
+func BenchmarkVRPC_ServerStream_HTTP_8MiB(b *testing.B) {
+	ts, c := setupVRPCStreamHTTP(b)
 	defer ts.Close()
 
 	ctx := context.Background()
@@ -1775,6 +1733,7 @@ func BenchmarkVRPC_ServerStream_HTTP_Throughput_8MiB_32KiB(b *testing.B) {
 	resp := new(Response)
 	dst := new(bytes.Buffer)
 
+	b.SetBytes(int64(req.A))
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -1791,8 +1750,81 @@ func BenchmarkVRPC_ServerStream_HTTP_Throughput_8MiB_32KiB(b *testing.B) {
 	}
 }
 
-func BenchmarkVRPC_ServerStream_HTTP_Flushy_512KiB_256B(b *testing.B) {
-	ts, c := setupStreamBenchServer(b)
+func BenchmarkVRPC_ServerStream_InProc_8MiB(b *testing.B) {
+	svc := new(StreamBenchService)
+	h := Def[StreamBenchService](svc)
+	codec := msgpackCodec{}
+
+	var reqBuf bytes.Buffer
+	req := &Request{A: 8 << 20, B: 32 << 10}
+	if err := codec.Encode(&reqBuf, req); err != nil {
+		b.Fatal(err)
+	}
+	reqBytes := reqBuf.Bytes()
+
+	bb := make([]byte, 0, 1<<10)
+
+	b.SetBytes(int64(req.A))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pr, pw := io.Pipe()
+
+		go func() {
+			r := &http.Request{
+				Method: http.MethodPost,
+				Header: http.Header{"Content-Type": []string{codec.ContentType()}},
+				URL:    &url.URL{Path: "/StreamBenchService/Download"},
+				Body:   io.NopCloser(bytes.NewReader(reqBytes)),
+			}
+			rw := &benchRW{}
+			rw.Reset(pw, 0)
+			h.ServeHTTP(rw, r)
+			_ = pw.Close()
+		}()
+
+		in := newFramedIO(codec, nil, pr)
+		total := 0
+
+		for {
+			m, err := in.decodeMarker()
+			if err != nil {
+				b.Fatal(err)
+			}
+			switch m {
+			case mPing:
+				continue
+			case mBin:
+				bb = bb[:0]
+				if err = in.dec.Decode(&bb); err != nil {
+					b.Fatal(err)
+				}
+				total += len(bb)
+			case mMsg:
+				var r Response
+				if err = in.dec.Decode(&r); err != nil {
+					b.Fatal(err)
+				}
+			case mEnd:
+				in.release()
+				goto done
+			case mError:
+				s, _ := in.decodeString()
+				b.Fatal(s)
+			default:
+				b.Fatal("unknown marker")
+			}
+		}
+	done:
+		if total != req.A {
+			b.Fatalf("got %d want %d", total, req.A)
+		}
+	}
+}
+
+func BenchmarkVRPC_ServerStream_HTTP_Flush_512KiB_256B(b *testing.B) {
+	ts, c := setupVRPCStreamHTTP(b)
 	defer ts.Close()
 
 	ctx := context.Background()
@@ -1800,6 +1832,7 @@ func BenchmarkVRPC_ServerStream_HTTP_Flushy_512KiB_256B(b *testing.B) {
 	resp := new(Response)
 	dst := new(bytes.Buffer)
 
+	b.SetBytes(int64(req.A))
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -1816,8 +1849,81 @@ func BenchmarkVRPC_ServerStream_HTTP_Flushy_512KiB_256B(b *testing.B) {
 	}
 }
 
-func BenchmarkVRPC_ClientStream_HTTP_Throughput_8MiB(b *testing.B) {
-	ts, c := setupStreamBenchServer(b)
+func BenchmarkVRPC_ServerStream_InProc_Flush_512KiB_256B(b *testing.B) {
+	svc := new(StreamBenchService)
+	h := Def[StreamBenchService](svc)
+	codec := msgpackCodec{}
+
+	var reqBuf bytes.Buffer
+	req := &Request{A: 512 << 10, B: 256}
+	if err := codec.Encode(&reqBuf, req); err != nil {
+		b.Fatal(err)
+	}
+	reqBytes := reqBuf.Bytes()
+
+	bb := make([]byte, 0, 1<<10)
+
+	b.SetBytes(int64(req.A))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pr, pw := io.Pipe()
+
+		go func() {
+			r := &http.Request{
+				Method: http.MethodPost,
+				Header: http.Header{"Content-Type": []string{codec.ContentType()}},
+				URL:    &url.URL{Path: "/StreamBenchService/DownloadFlushy"},
+				Body:   io.NopCloser(bytes.NewReader(reqBytes)),
+			}
+			rw := &benchRW{}
+			rw.Reset(pw, 0)
+			h.ServeHTTP(rw, r)
+			_ = pw.Close()
+		}()
+
+		in := newFramedIO(codec, nil, pr)
+		total := 0
+
+		for {
+			m, err := in.decodeMarker()
+			if err != nil {
+				b.Fatal(err)
+			}
+			switch m {
+			case mPing:
+				continue
+			case mBin:
+				bb = bb[:0]
+				if err := in.dec.Decode(&bb); err != nil {
+					b.Fatal(err)
+				}
+				total += len(bb)
+			case mMsg:
+				var r Response
+				if err := in.dec.Decode(&r); err != nil {
+					b.Fatal(err)
+				}
+			case mEnd:
+				in.release()
+				goto done
+			case mError:
+				s, _ := in.decodeString()
+				b.Fatal(s)
+			default:
+				b.Fatal("unknown marker")
+			}
+		}
+	done:
+		if total != req.A {
+			b.Fatalf("got %d want %d", total, req.A)
+		}
+	}
+}
+
+func BenchmarkVRPC_ClientStream_HTTP_8MiB(b *testing.B) {
+	ts, c := setupVRPCStreamHTTP(b)
 	defer ts.Close()
 
 	ctx := context.Background()
@@ -1826,6 +1932,7 @@ func BenchmarkVRPC_ClientStream_HTTP_Throughput_8MiB(b *testing.B) {
 
 	payload := strings.Repeat("x", 8<<20)
 
+	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -1833,6 +1940,78 @@ func BenchmarkVRPC_ClientStream_HTTP_Throughput_8MiB(b *testing.B) {
 		*resp = Response{}
 		src := strings.NewReader(payload)
 		if err := c.ClientStream(ctx, "StreamBenchService", "Upload", req, src, resp); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVRPC_ClientStream_InProc_8MiB(b *testing.B) {
+	svc := new(StreamBenchService)
+	h := Def[StreamBenchService](svc)
+	codec := msgpackCodec{}
+
+	ctx := context.Background()
+	reqObj := &Request{A: 1, B: 2}
+	resp := new(Response)
+
+	payload := bytes.Repeat([]byte{'x'}, 8<<20)
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		*resp = Response{}
+
+		pr, pw := io.Pipe()
+
+		errCh := make(chan error, 1)
+		go func() {
+			defer close(errCh)
+			out := newFramedIO(codec, pw, nil)
+			defer out.release()
+			defer func() { _ = pw.Close() }()
+
+			if err := out.sendMsg(reqObj); err != nil {
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			if _, err := io.Copy(out, bytes.NewReader(payload)); err != nil {
+				_ = out.sendError(err)
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			if err := out.sendEnd(); err != nil {
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+
+		r := &http.Request{
+			Method: http.MethodPost,
+			Header: http.Header{"Content-Type": []string{codec.ContentType()}},
+			URL:    &url.URL{Path: "/StreamBenchService/Upload"},
+			Body:   pr,
+		}
+		r = r.WithContext(ctx)
+		r.ContentLength = -1
+
+		rw := &benchRW{}
+		rw.Reset(nil, 512)
+		h.ServeHTTP(rw, r)
+
+		if rw.status != http.StatusOK {
+			errText := rw.hdr.Get(ErrorHeader)
+			b.Fatalf("status %d err=%q", rw.status, errText)
+		}
+		if err := codec.Decode(bytes.NewReader(rw.buf.Bytes()), resp); err != nil {
+			b.Fatal(err)
+		}
+		if err := <-errCh; err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1864,8 +2043,8 @@ func (r *chunkedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func BenchmarkVRPC_ClientStream_HTTP_FlushySource_512KiB_256B(b *testing.B) {
-	ts, c := setupStreamBenchServer(b)
+func BenchmarkVRPC_ClientStream_HTTP_Flush_512KiB_256B(b *testing.B) {
+	ts, c := setupVRPCStreamHTTP(b)
 	defer ts.Close()
 
 	ctx := context.Background()
@@ -1874,6 +2053,7 @@ func BenchmarkVRPC_ClientStream_HTTP_FlushySource_512KiB_256B(b *testing.B) {
 
 	payload := bytes.Repeat([]byte{'x'}, 512<<10)
 
+	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -1886,41 +2066,75 @@ func BenchmarkVRPC_ClientStream_HTTP_FlushySource_512KiB_256B(b *testing.B) {
 	}
 }
 
-func BenchmarkVRPC_ServerStream_Direct_Throughput_8MiB_32KiB(b *testing.B) {
-	svc := new(StreamBenchService)
-	h := Def[StreamBenchService](svc)
+func BenchmarkVRPC_ClientStream_InProc_Flush_512KiB_256B(b *testing.B) {
 
+	h := Def[StreamBenchService](new(StreamBenchService))
 	codec := msgpackCodec{}
 
-	encodeReq := func(req *Request) []byte {
-		buf := new(bytes.Buffer)
-		if err := codec.Encode(buf, req); err != nil {
-			b.Fatal(err)
-		}
-		return buf.Bytes()
-	}
+	ctx := context.Background()
+	reqObj := &Request{A: 1, B: 2}
+	resp := new(Response)
 
-	reqVal := &Request{A: 8 << 20, B: 32 << 10}
-	body := encodeReq(reqVal)
+	payload := bytes.Repeat([]byte{'x'}, 512<<10)
 
+	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/StreamBenchService/Download", bytes.NewReader(body))
-		r = r.WithContext(context.Background())
-		r.Header.Set("Content-Type", codec.ContentType())
+		*resp = Response{}
 
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
+		pr, pw := io.Pipe()
 
-		if w.Code != http.StatusOK {
-			b.Fatalf("status: %d", w.Code)
+		errCh := make(chan error, 1)
+		go func() {
+			defer close(errCh)
+			out := newFramedIO(codec, pw, nil)
+			defer out.release()
+			defer func() { _ = pw.Close() }()
+
+			if err := out.sendMsg(reqObj); err != nil {
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			src := &chunkedReader{b: payload, size: 256}
+			if _, err := io.Copy(out, src); err != nil {
+				_ = out.sendError(err)
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			if err := out.sendEnd(); err != nil {
+				_ = pw.CloseWithError(err)
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+
+		r := &http.Request{
+			Method: http.MethodPost,
+			Header: http.Header{"Content-Type": []string{codec.ContentType()}},
+			URL:    &url.URL{Path: "/StreamBenchService/Upload"},
+			Body:   pr,
 		}
-		if errText := w.Header().Get(ErrorHeader); errText != "" {
-			b.Fatalf("err header: %s", errText)
+		r = r.WithContext(ctx)
+		r.ContentLength = -1
+
+		rw := &benchRW{}
+		rw.Reset(nil, 512)
+		h.ServeHTTP(rw, r)
+
+		if rw.status != http.StatusOK {
+			errText := rw.hdr.Get(ErrorHeader)
+			b.Fatalf("status %d err=%q", rw.status, errText)
 		}
-		// We intentionally don't decode and validate full stream here;
-		// the HTTP bench versions do that.
+		if err := codec.Decode(bytes.NewReader(rw.buf.Bytes()), resp); err != nil {
+			b.Fatal(err)
+		}
+		if err := <-errCh; err != nil {
+			b.Fatal(err)
+		}
 	}
 }
