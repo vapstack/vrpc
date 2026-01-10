@@ -48,6 +48,8 @@ func (s *Service) Method(ctx context.Context, req *Request, w io.Writer) (*Respo
 func (s *Service) Method(ctx context.Context, req *Request, r io.Reader) (*Response, error)
 ```
 
+The request parameter may be either a value or a pointer.
+
 Bidirectional streaming is hard to get right on top of HTTP/1 so it's not supported.
 
 ### Server

@@ -134,6 +134,7 @@ type methodType struct {
 
 	fn reflect.Value
 	rt reflect.Type
+	dt reflect.Type
 }
 
 func (m *methodType) call(args *[]reflect.Value, n int) (results []reflect.Value, err error) {
@@ -145,6 +146,17 @@ func (m *methodType) call(args *[]reflect.Value, n int) (results []reflect.Value
 		argPool.Put(args)
 	}()
 	return m.fn.Call((*args)[:n]), nil
+}
+
+func (m *methodType) decodeRequest(codec Codec, r io.Reader) (arg reflect.Value, err error) {
+	ptr := reflect.New(m.dt)
+	if err = codec.Decode(r, ptr.Interface()); err != nil {
+		return reflect.Value{}, err
+	}
+	if m.rt.Kind() == reflect.Pointer {
+		return ptr, nil
+	}
+	return ptr.Elem(), nil
 }
 
 type methodMode uint8
@@ -338,9 +350,15 @@ func newHandler(service string, impl any, contract reflect.Type, strict bool) (*
 			}
 		}
 
+		rt := s.req
+		dt := s.req
+		if dt.Kind() == reflect.Pointer {
+			dt = dt.Elem()
+		}
 		h.methods[method.Name] = &methodType{
 			fn:   h.impl.MethodByName(method.Name),
-			rt:   s.req.Elem(),
+			rt:   rt,
+			dt:   dt,
 			mode: s.mode,
 		}
 	}
@@ -398,9 +416,10 @@ func rpcMethod(mtype reflect.Type, offset int) (rpcSignature, bool) {
 		return sig, false
 	}
 	sig.req = mtype.In(reqIdx)
-	if sig.req.Kind() != reflect.Pointer {
-		return sig, false
-	}
+
+	// if sig.req.Kind() != reflect.Pointer {
+	// 	return sig, false
+	// }
 
 	if mtype.NumIn() == 2+offset {
 		sig.mode = modeUnary
@@ -469,8 +488,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveUnary(w http.ResponseWriter, r *http.Request, m *methodType, codec Codec, ctype string) {
-	req := reflect.New(m.rt)
-	if err := codec.Decode(r.Body, req.Interface()); err != nil {
+	req, err := m.decodeRequest(codec, r.Body)
+	if err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -902,8 +921,8 @@ func (fio *framedIO) Read(p []byte) (int, error) {
 
 func (h *Handler) serveServerStream(w http.ResponseWriter, r *http.Request, m *methodType, codec Codec, ctype string) {
 
-	req := reflect.New(m.rt)
-	if err := codec.Decode(r.Body, req.Interface()); err != nil {
+	req, err := m.decodeRequest(codec, r.Body)
+	if err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -976,11 +995,14 @@ func (h *Handler) serveClientStream(w http.ResponseWriter, r *http.Request, m *m
 		return
 	}
 
-	req := reflect.New(m.rt)
+	req := reflect.New(m.dt)
 	if err = in.dec.Decode(req.Interface()); err != nil {
 		w.Header().Set(ErrorHeader, err.Error())
 		w.WriteHeader(http.StatusBadRequest)
 		return
+	}
+	if m.rt.Kind() != reflect.Pointer {
+		req = req.Elem()
 	}
 
 	args := argPool.Get().(*[]reflect.Value)
