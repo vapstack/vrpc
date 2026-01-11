@@ -1352,6 +1352,33 @@ func (c *Client) ServerStream(ctx context.Context, service, method string, reque
 	}
 }
 
+// ServerStream is a generic helper function that invokes a server streaming method on the Client
+// and returns result as *T.
+func ServerStream[T any](c *Client, ctx context.Context, service, method string, req any, dst io.Writer) (*T, error) {
+	res := new(T)
+	if err := c.ServerStream(ctx, service, method, req, dst, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// ServerStreamFor is a generic helper function that invokes a server streaming method on the Client
+// using S type as a service name and returns result as *T.
+func ServerStreamFor[S any, T any](c *Client, ctx context.Context, service, method string, req any, dst io.Writer) (*T, error) {
+	var svc string
+	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
+		svc = v.(string)
+	} else {
+		svc = reflect.TypeFor[S]().Name()
+		typeNames.Store(reflect.TypeFor[S](), svc)
+	}
+	res := new(T)
+	if err := c.ServerStream(ctx, service, method, req, dst, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // ClientStream calls an RPC method that streams data from the client to the server.
 //
 // Server implementation receives an io.Reader and may read the stream until EOF,
@@ -1464,6 +1491,33 @@ func (c *Client) ClientStream(ctx context.Context, service, method string, reque
 	}
 }
 
+// ClientStream is a generic helper function that invokes a client streaming method on the Client
+// and returns result as *T.
+func ClientStream[T any](c *Client, ctx context.Context, service, method string, req any, src io.Reader) (*T, error) {
+	res := new(T)
+	if err := c.ClientStream(ctx, service, method, req, src, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// ClientStreamFor is a generic helper function that invokes a client streaming method on the Client
+// using S type as a service name and returns result as *T.
+func ClientStreamFor[S any, T any](c *Client, ctx context.Context, service, method string, req any, src io.Reader) (*T, error) {
+	var svc string
+	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
+		svc = v.(string)
+	} else {
+		svc = reflect.TypeFor[S]().Name()
+		typeNames.Store(reflect.TypeFor[S](), svc)
+	}
+	res := new(T)
+	if err := c.ClientStream(ctx, service, method, req, src, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // Call is a generic helper function that invokes a method on the Client
 // and returns result as *T.
 func Call[T any](c *Client, ctx context.Context, service, method string, req any) (*T, error) {
@@ -1479,7 +1533,6 @@ var typeNames sync.Map
 // CallFor is a generic helper function that invokes a method on the Client
 // using S type as a service name and returns result as *T.
 func CallFor[S any, T any](c *Client, ctx context.Context, method string, req any) (*T, error) {
-
 	var svc string
 	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
 		svc = v.(string)
@@ -1487,7 +1540,6 @@ func CallFor[S any, T any](c *Client, ctx context.Context, method string, req an
 		svc = reflect.TypeFor[S]().Name()
 		typeNames.Store(reflect.TypeFor[S](), svc)
 	}
-
 	res := new(T)
 	if err := c.Call(ctx, svc, method, req, res); err != nil {
 		return nil, err
@@ -1511,10 +1563,6 @@ func (c *Client) Notify(ctx context.Context, service, method string, request any
 // Errors are returned only if encoding fails.
 func (c *Client) Beacon(ctx context.Context, service, method string, request any) error {
 	return c.call(ctx, service, method, request, nil, "B")
-}
-
-type AAA struct {
-	*bytes.Buffer
 }
 
 func (c *Client) call(ctx context.Context, service, method string, request any, response any, rType string) error {
