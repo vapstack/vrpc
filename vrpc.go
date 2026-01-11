@@ -1474,10 +1474,20 @@ func Call[T any](c *Client, ctx context.Context, service, method string, req any
 	return res, nil
 }
 
+var typeNames sync.Map
+
 // CallFor is a generic helper function that invokes a method on the Client
 // using S type as a service name and returns result as *T.
 func CallFor[S any, T any](c *Client, ctx context.Context, method string, req any) (*T, error) {
-	svc := reflect.TypeFor[S]().Name()
+
+	var svc string
+	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
+		svc = v.(string)
+	} else {
+		svc = reflect.TypeFor[S]().Name()
+		typeNames.Store(reflect.TypeFor[S](), svc)
+	}
+
 	res := new(T)
 	if err := c.Call(ctx, svc, method, req, res); err != nil {
 		return nil, err
