@@ -1364,7 +1364,7 @@ func ServerStream[T any](c *Client, ctx context.Context, service, method string,
 
 // ServerStreamFor is a generic helper function that invokes a server streaming method on the Client
 // using S type as a service name and returns result as *T.
-func ServerStreamFor[S any, T any](c *Client, ctx context.Context, service, method string, req any, dst io.Writer) (*T, error) {
+func ServerStreamFor[S any, T any](c *Client, ctx context.Context, method string, req any, dst io.Writer) (*T, error) {
 	var svc string
 	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
 		svc = v.(string)
@@ -1373,7 +1373,7 @@ func ServerStreamFor[S any, T any](c *Client, ctx context.Context, service, meth
 		typeNames.Store(reflect.TypeFor[S](), svc)
 	}
 	res := new(T)
-	if err := c.ServerStream(ctx, service, method, req, dst, res); err != nil {
+	if err := c.ServerStream(ctx, svc, method, req, dst, res); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -1503,7 +1503,7 @@ func ClientStream[T any](c *Client, ctx context.Context, service, method string,
 
 // ClientStreamFor is a generic helper function that invokes a client streaming method on the Client
 // using S type as a service name and returns result as *T.
-func ClientStreamFor[S any, T any](c *Client, ctx context.Context, service, method string, req any, src io.Reader) (*T, error) {
+func ClientStreamFor[S any, T any](c *Client, ctx context.Context, method string, req any, src io.Reader) (*T, error) {
 	var svc string
 	if v, ok := typeNames.Load(reflect.TypeFor[S]()); ok {
 		svc = v.(string)
@@ -1512,7 +1512,7 @@ func ClientStreamFor[S any, T any](c *Client, ctx context.Context, service, meth
 		typeNames.Store(reflect.TypeFor[S](), svc)
 	}
 	res := new(T)
-	if err := c.ClientStream(ctx, service, method, req, src, res); err != nil {
+	if err := c.ClientStream(ctx, svc, method, req, src, res); err != nil {
 		return nil, err
 	}
 	return res, nil
