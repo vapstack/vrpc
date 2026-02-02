@@ -1487,7 +1487,7 @@ func (c *Client) ClientStream(ctx context.Context, service, method string, reque
 		return &Error{"server failed to encode response but did not provide any error"}
 
 	default:
-		return &Error{"unknown error"}
+		return &Error{fmt.Sprintf("unknown error: %v", res.Status)}
 	}
 }
 
@@ -1637,7 +1637,7 @@ func (c *Client) call(ctx context.Context, service, method string, request any, 
 		return &Error{"server failed to encode response but did not provide any error"}
 
 	default:
-		return &Error{"unknown error"}
+		return &Error{fmt.Sprintf("unknown error: %v", res.Status)}
 	}
 }
 
